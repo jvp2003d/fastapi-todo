@@ -1,0 +1,134 @@
+# Multi-stage build para máxima seguridad empresarial
+# Stage 1: Build environment (privileged)
+FROM python:3.11.1-alpine3.17 AS builder
+
+# Metadata de seguridad
+LABEL maintainer="jorge@creative-quality.es" \
+      version="1.0.0" \
+      security.scan="required" \
+      compliance="SOC2,ISO27001"
+
+# Variables de build
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION
+ARG DEV=false
+
+# Labels para trazabilidad
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.revision=$VCS_REF \
+      org.opencontainers.image.version=$VERSION
+
+# Configurar entorno seguro
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=random \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Instalar dependencias de build de forma segura
+RUN apk update --no-cache && \
+    apk upgrade --no-cache && \
+    apk add --no-cache --virtual .build-deps \
+        gcc \
+        musl-dev \
+        libffi-dev \
+        python3-dev \
+        postgresql-dev \
+        mariadb-dev && \
+    rm -rf /var/cache/apk/*
+
+# Crear estructura de directorios
+RUN mkdir -p /build /wheels
+
+# Copiar solo requirements para optimizar cache
+COPY requirements/ /build/requirements/
+
+# Crear virtual environment y compilar wheels
+RUN python -m venv /build/venv && \
+    /build/venv/bin/pip install --upgrade pip setuptools wheel && \
+    /build/venv/bin/pip wheel --wheel-dir /wheels \
+        -r /build/requirements/requeriments.txt && \
+    if [ "$DEV" = "true" ]; then \
+        /build/venv/bin/pip wheel --wheel-dir /wheels \
+            -r /build/requirements/requirements.dev.txt; \
+    fi
+
+# Stage 2: Runtime environment (minimal y seguro)
+FROM python:3.11.1-alpine3.17 AS runtime
+
+# Metadata de runtime
+LABEL stage="runtime" \
+      security.level="high"
+
+# Configurar entorno de runtime
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=random \
+    PATH="/app/venv/bin:$PATH" \
+    DJANGO_SETTINGS_MODULE="config.settings.production"
+
+# Instalar solo dependencias de runtime necesarias
+RUN apk update --no-cache && \
+    apk upgrade --no-cache && \
+    apk add --no-cache \
+        postgresql-client \
+        mariadb-client \
+        curl \
+        ca-certificates \
+        tzdata && \
+    rm -rf /var/cache/apk/*
+
+# Crear usuario con UID/GID específicos para consistencia K8s
+RUN addgroup -g 10001 -S django && \
+    adduser -u 10001 -S django -G django -h /app
+
+# Crear estructura de directorios con permisos mínimos
+RUN mkdir -p /app/static /app/media /app/logs /tmp/django && \
+    chown -R django:django /app /tmp/django && \
+    chmod 750 /app && \
+    chmod 755 /app/static /app/media && \
+    chmod 700 /app/logs /tmp/django
+
+# Copiar wheels desde build stage
+COPY --from=builder --chown=django:django /wheels /wheels
+
+# Crear virtual environment de runtime
+RUN python -m venv /app/venv && \
+    /app/venv/bin/pip install --upgrade pip && \
+    /app/venv/bin/pip install --no-index --find-links /wheels \
+        -r /wheels/requirements.txt && \
+    rm -rf /wheels /root/.cache
+
+# Copiar aplicación con ownership correcto
+COPY --chown=django:django ./project /app/project/
+COPY --chown=django:django ./entrypoint.sh /app/entrypoint.sh
+
+# Configurar permisos finales
+RUN chmod +x /app/entrypoint.sh && \
+    find /app -type f -name "*.py" -exec chmod 644 {} \; && \
+    find /app -type d -exec chmod 755 {} \;
+
+# Configurar directorio de trabajo
+WORKDIR /app
+
+# Crear healthcheck script seguro
+RUN echo '#!/bin/sh\ncurl -f http://localhost:8000/health/ > /dev/null 2>&1 || exit 1' > /app/healthcheck.sh && \
+    chmod +x /app/healthcheck.sh && \
+    chown django:django /app/healthcheck.sh
+
+# Cambiar a usuario no privilegiado ANTES de EXPOSE
+USER django:django
+
+# Exponer puerto (solo documentativo)
+EXPOSE 8000
+
+# Healthcheck mejorado y seguro
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/app/healthcheck.sh"]
+
+# Configurar entrypoint seguro
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Comando por defecto
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "3", "config.wsgi:application"]
